@@ -13,8 +13,16 @@
   * { box-sizing:border-box; }
   html,body { margin:0; height:100%; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
               background:var(--bg); color:var(--ink); }
-  #app { display:grid; grid-template-columns:1fr 420px; height:100vh; }
-  #map { height:100vh; }
+  body { display:flex; flex-direction:column; }
+  #proj-nav { display:flex; background:var(--panel); border-bottom:1px solid var(--line);
+              padding:0 16px; flex-shrink:0; z-index:1000; }
+  #proj-nav .proj-link { display:inline-flex; align-items:center; padding:10px 14px;
+              font-size:13px; font-weight:500; color:var(--muted); text-decoration:none;
+              border-bottom:2px solid transparent; }
+  #proj-nav .proj-link:hover { color:var(--ink); }
+  #proj-nav .proj-link.active { color:var(--accent); border-bottom-color:var(--accent); }
+  #app { display:grid; grid-template-columns:1fr 420px; flex:1; min-height:0; }
+  #map { height:100%; }
   #panel { background:var(--panel); border-left:1px solid var(--line); overflow-y:auto; padding:20px; }
   h1 { font-size:16px; margin:0 0 4px; }
   .sub { color:var(--muted); font-size:12px; margin-bottom:16px; line-height:1.5; }
@@ -64,6 +72,10 @@
 </style>
 </head>
 <body>
+<nav id="proj-nav">
+  <a href="index.html" class="proj-link active">NYC Landmarks</a>
+  <a href="crash_index.html" class="proj-link">Pedestrian Safety</a>
+</nav>
 <div id="app">
   <div id="map"></div>
   <div id="panel">
