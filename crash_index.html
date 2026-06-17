@@ -84,11 +84,22 @@
   .badge.ns{background:rgba(255,107,107,.16);color:#ff6b6b}
   .note{color:var(--muted);font-size:12.5px;margin-top:8px;max-width:1040px}
   .note code{color:#cdd6df}
+  #proj-nav { display:flex; background:var(--panel); border-bottom:1px solid var(--line);
+              padding:0 32px; position:sticky; top:0; z-index:1000; }
+  #proj-nav .proj-link { display:inline-flex; align-items:center; padding:10px 14px;
+              font-size:13px; font-weight:500; color:var(--muted); text-decoration:none;
+              border-bottom:2px solid transparent; }
+  #proj-nav .proj-link:hover { color:var(--ink); }
+  #proj-nav .proj-link.active { color:var(--accent); border-bottom-color:var(--accent); }
   @media(max-width:1000px){.grid{grid-template-columns:1fr}
     .cards{grid-template-columns:repeat(2,1fr)}}
 </style>
 </head>
 <body>
+<nav id="proj-nav">
+  <a href="index.html" class="proj-link">NYC Landmarks</a>
+  <a href="crash_index.html" class="proj-link active">Pedestrian Safety</a>
+</nav>
 <header>
   <h1>Car collisions above 60th Street, before &amp; after congestion pricing</h1>
   <p class="sub">Congestion pricing went live <b>Jan 5, 2025</b>; the tolled zone
