@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
 """Assemble crash_data.json: car collisions above 60th St (Manhattan) before &
-after congestion pricing (live 2025-01-05), with a focus on the Upper East Side
-and on whether the effect concentrates near the 60th St line.
+after congestion pricing (live 2025-01-05), with a focus on the Upper East Side,
+Upper West Side, and Upper Manhattan (CB9–CB12: West Harlem, Central Harlem,
+East Harlem, Washington Heights/Inwood).
 
 Sources (NYC Open Data / Socrata):
   h9gi-nx95  Motor Vehicle Collisions - Crashes (date, lat/lon, injuries, deaths,
              pedestrian breakdown, collision_id)
-  bm4k-52h4  Motor Vehicle Collisions - Vehicle (state_registration; join by
-             collision_id) -> NY vs out-of-state plates
+  bm4k-52h4  Motor Vehicle Collisions - Vehicle (state_registration,
+             vehicle_type_code_1; join by collision_id)
   gthc-hcne  Borough Boundaries (Manhattan polygon for the 60th St cut)
-  y76i-bdw7  Police Precincts (precinct 19 = Upper East Side)
+  y76i-bdw7  Police Precincts (precinct 19 = UES, 20+24 = UWS)
+  jp9i-3b7y  Community Districts (CB9=109, CB10=110, CB11=111, CB12=112)
 
 Geography: the Congestion Relief Zone is Manhattan *below* 60th St; "above 60th"
-is just outside the tolled zone -- the place to look for displaced traffic.
-Regions: above-60th (all of Manhattan north of the line), Upper East Side
-(precinct 19), and rest of NYC (citywide minus above-60th).
+is just outside the tolled zone. Upper Manhattan (CB9–CB12) is the advocacy focus:
+dense, transit-dependent, low-car-ownership neighborhoods on wide arterials.
 
-Output: monthly series (raw + indexed to 2024 baseline) for collisions /
-pedestrian-involved collisions / pedestrians injured & killed; before/after by
-distance band from 60th St; NY vs out-of-state plate share; geometry + sampled
-points for the map.
+Output: monthly series + 2024→2025 summaries for all regions; distance-band
+analysis; difference-in-differences; plate origin; latitude-band gradient (9
+bands from 60th to Inwood, for the boundary-vs-diversion test); vehicle type
+breakdown for Upper Manhattan pedestrian crashes; geometry + sampled crash points
+with vehicle type and UMN region flags.
 """
 import json
 import math
@@ -54,6 +56,18 @@ METRIC_FIELDS = ("crashes", "ped_crashes", "ped_injured", "ped_killed",
 NEAR_BANDS = (0, 1)        # 60–70 St, 0–0.8 km from the line (treatment)
 FAR_BANDS = (4, 5, 6)      # 80–95 St, 1.6–2.8 km (within-UES control)
 PERIODS = ("base", "pre", "post")  # 2023, 2024, 2025
+
+# Upper Manhattan community districts (CB9–CB12)
+UMN_CDS = {
+    "harlem_west":    109,  # West Harlem / Hamilton Heights
+    "harlem_central": 110,  # Central Harlem
+    "harlem_east":    111,  # East Harlem
+    "washington_hts": 112,  # Washington Heights + Inwood
+}
+UMN_NAMES = tuple(UMN_CDS.keys())
+
+# Vehicle type categories for the striking-vehicle chart
+VTYPE_LABELS = ["car", "suv", "truck", "moped", "ebike", "other"]
 
 
 def soda(dataset, params, retries=5):
@@ -179,6 +193,100 @@ def add(series, key, vals):
         b[f] += v
 
 
+def vehicle_type_bin(vtype_str):
+    """Map a raw vehicle_type_code_1 string to a dashboard category."""
+    v = (vtype_str or "").lower().strip()
+    if any(x in v for x in ("e-bike", "ebike", "e bike", "electric bike",
+                              "e-scooter", "escooter", "electric scooter")):
+        return "ebike"
+    if any(x in v for x in ("moped", "motorcycle", "motorbike", "motor bike")):
+        return "moped"
+    if any(x in v for x in ("sport utility", "suv", "station wagon")):
+        return "suv"
+    if any(x in v for x in ("pick-up", "pickup", "flatbed", "dump truck",
+                              "tractor", "semi", "cement", "flat bed")):
+        return "truck"
+    if any(x in v for x in ("van", "bus", "truck", "garbage", "cargo")):
+        return "truck"
+    if any(x in v for x in ("sedan", "passenger vehicle", "taxi", "livery",
+                              "limousine", "roadster", "coupe", "convertible")):
+        return "car"
+    if v in ("", "unknown", "other", "unspecified"):
+        return "other"
+    return "car"  # most unrecognized types are passenger vehicles
+
+
+def vtype_counts(collision_ids):
+    """Return {vtype: count} for a collection of collision IDs (one per crash)."""
+    counts = {k: 0 for k in VTYPE_LABELS}
+    cids = list(collision_ids)
+    seen_cids = set()
+    for i in range(0, len(cids), 300):
+        batch = cids[i:i + 300]
+        inlist = ",".join("'" + c + "'" for c in batch)
+        rows = soda("bm4k-52h4", {
+            "$select": "collision_id,vehicle_type_code_1",
+            "$where": f"collision_id in ({inlist})",
+            "$limit": len(batch) + 50,
+        })
+        for row_v in rows:
+            cv = row_v.get("collision_id")
+            if cv in seen_cids:
+                continue
+            seen_cids.add(cv)
+            vt = vehicle_type_bin(row_v.get("vehicle_type_code_1"))
+            counts[vt] = counts.get(vt, 0) + 1
+    return counts
+
+
+def build_latitude_bands():
+    """9 latitude bands from 60th St to Inwood: crash counts + % change 2024→2025."""
+    BAND_DEFS = [
+        ("60–65 St",       40.7646, 40.7682),
+        ("65–72 St",       40.7682, 40.7726),
+        ("72–79 St",       40.7726, 40.7769),
+        ("79–86 St",       40.7769, 40.7805),
+        ("86–96 St",       40.7805, 40.7860),
+        ("96–110 St",      40.7860, 40.7960),
+        ("110–125 St",     40.7960, 40.8085),
+        ("125–155 St",     40.8085, 40.8300),
+        ("155 St–Inwood",  40.8300, 41.0000),
+    ]
+    out = []
+    for label, lat_lo, lat_hi in BAND_DEFS:
+        row = {"label": label}
+        lat_where = (f"upper(borough)='MANHATTAN' AND latitude IS NOT NULL "
+                     f"AND latitude >= {lat_lo} AND latitude < {lat_hi}")
+        for yr, yr_s, yr_e in (("2024", "2024-01-01T00:00:00", "2025-01-01T00:00:00"),
+                                ("2025", "2025-01-01T00:00:00", "2026-01-01T00:00:00")):
+            date_clause = f"crash_date >= '{yr_s}' AND crash_date < '{yr_e}'"
+            res = soda("h9gi-nx95", {
+                "$select": ("count(*) AS n,"
+                            "sum(number_of_pedestrians_injured) AS pi,"
+                            "sum(number_of_pedestrians_killed) AS pk"),
+                "$where": f"{lat_where} AND {date_clause}",
+                "$limit": 1,
+            })
+            ped_res = soda("h9gi-nx95", {
+                "$select": "count(*) AS n",
+                "$where": (f"{lat_where} AND {date_clause} AND "
+                           "(number_of_pedestrians_injured > 0 "
+                           "OR number_of_pedestrians_killed > 0)"),
+                "$limit": 1,
+            })
+            r0 = (res or [{}])[0]
+            row[f"total_{yr}"]   = int(float(r0.get("n",  0)))
+            row[f"ped_{yr}"]     = int(float((ped_res or [{}])[0].get("n", 0)))
+            row[f"ped_inj_{yr}"] = int(float(r0.get("pi", 0)))
+            row[f"ped_kil_{yr}"] = int(float(r0.get("pk", 0)))
+        t24, t25 = row["total_2024"], row["total_2025"]
+        p24, p25 = row["ped_2024"],   row["ped_2025"]
+        row["pct_total"] = round(100 * (t25 - t24) / t24, 1) if t24 else None
+        row["pct_ped"]   = round(100 * (p25 - p24) / p24, 1) if p24 else None
+        out.append(row)
+    return out
+
+
 # ---------------------------------------------------------------------------
 def precinct_geom(where):
     """Fetch one or more precincts and merge them into a single MultiPolygon."""
@@ -190,10 +298,28 @@ def precinct_geom(where):
     return {"type": "MultiPolygon", "coordinates": coords}
 
 
+def cd_geom(boro_cd_val):
+    """Fetch a Community District boundary from NYC Open Data (dataset jp9i-3b7y)."""
+    rows = soda("jp9i-3b7y", {"$where": f"boro_cd={boro_cd_val}", "$limit": 5})
+    if not rows:
+        print(f"  WARNING: no geometry returned for boro_cd={boro_cd_val}")
+        return None
+    g = rows[0]["the_geom"]
+    coords = (g["coordinates"] if g["type"] == "MultiPolygon"
+              else [g["coordinates"]])
+    return {"type": "MultiPolygon", "coordinates": coords}
+
+
 print("Fetching boundaries ...")
 MN = soda("gthc-hcne", {"$where": "borocode='1'", "$limit": 5})[0]["the_geom"]
 UES = precinct_geom("precinct=19")              # Upper East Side
 UWS = precinct_geom("precinct in (20,24)")      # Upper West Side (20 + 24)
+
+print("Fetching Upper Manhattan community district boundaries ...")
+umn_geoms = {}
+for _name, _cd_id in UMN_CDS.items():
+    umn_geoms[_name] = cd_geom(_cd_id)
+    print(f"  {_name} (CD{_cd_id}): {'ok' if umn_geoms[_name] else 'MISSING'}")
 
 BBOX = ("latitude > 40.758 AND latitude < 40.885 "
         "AND longitude > -74.02 AND longitude < -73.905")
@@ -210,13 +336,23 @@ crash_rows = paginate(
 print(f"  {len(crash_rows)} crashes in bbox")
 
 above = {}                          # monthly buckets, all above-60th Manhattan
-corridor_geom = {"ues": UES, "uws": UWS}     # neighborhood corridors
-cmonths = {"ues": {}, "uws": {}}    # monthly buckets per corridor
+corridor_geom = {"ues": UES, "uws": UWS}
+cmonths = {"ues": {}, "uws": {}}    # monthly buckets per named corridor
+
+# Extend corridor map with Upper Manhattan community districts
+for _n in UMN_NAMES:
+    if umn_geoms.get(_n):
+        corridor_geom[_n] = umn_geoms[_n]
+        cmonths[_n] = {}
+
 SCOPES = ("above", "ues", "uws")
 dist = {s: {p: [new_bucket() for _ in BAND_LABELS] for p in PERIODS}
-        for s in SCOPES}            # distance-band totals (base=2023)
+        for s in SCOPES}
 # collision_ids for the plate join (2024 pre / 2025 post only)
 ids = {s: {"pre": set(), "post": set()} for s in SCOPES}
+# Pedestrian crash IDs per Upper Manhattan CD (used for vehicle type chart)
+umn_ped_ids = {n: {"pre": set(), "post": set()} for n in UMN_NAMES}
+
 crash_points = []
 
 for r in crash_rows:
@@ -255,24 +391,86 @@ for r in crash_rows:
         if not inside:
             continue
         add(cmonths[cname], mk, vals)
-        if period:
-            for f in METRIC_FIELDS:
-                dist[cname][period][band][f] += vals[f]
-        if period in ("pre", "post") and cid:
-            ids[cname][period].add(cid)
+        if cname in SCOPES:
+            if period:
+                for f in METRIC_FIELDS:
+                    dist[cname][period][band][f] += vals[f]
+            if period in ("pre", "post") and cid:
+                ids[cname][period].add(cid)
+        elif cname in UMN_NAMES:
+            # Track pedestrian crash IDs for vehicle-type chart (no dist needed)
+            if period in ("pre", "post") and cid and (ped_i + ped_k) > 0:
+                umn_ped_ids[cname][period].add(cid)
 
     crash_points.append({
         "lat": round(lat, 5), "lon": round(lon, 5), "d": r["crash_date"][:10],
         "ped": 1 if (ped_i + ped_k) > 0 else 0, "kill": int(vals["deaths"]),
-        "ues": 1 if tag["ues"] else 0, "uws": 1 if tag["uws"] else 0,
+        "ues": 1 if tag.get("ues") else 0,
+        "uws": 1 if tag.get("uws") else 0,
+        "hw":  1 if tag.get("harlem_west") else 0,
+        "hc":  1 if tag.get("harlem_central") else 0,
+        "he":  1 if tag.get("harlem_east") else 0,
+        "wh":  1 if tag.get("washington_hts") else 0,
         "street": (r.get("on_street_name") or "").strip(),
+        "_cid": cid,  # temporary; stripped after vehicle-type join below
     })
-ues, uws = cmonths["ues"], cmonths["uws"]
+
+ues = cmonths["ues"]
+uws = cmonths["uws"]
+umn_month_data = {n: cmonths[n] for n in UMN_NAMES if n in cmonths}
 print(f"  above 60th: {sum(b['crashes'] for b in above.values()):.0f}; "
       f"UES: {sum(b['crashes'] for b in ues.values()):.0f}; "
       f"UWS: {sum(b['crashes'] for b in uws.values()):.0f}")
+for _n, _bkts in umn_month_data.items():
+    print(f"  {_n}: {sum(b['crashes'] for b in _bkts.values()):.0f} crashes")
 
-# --- Citywide monthly totals -> rest of NYC = citywide - above.
+# --- Vehicle type for sampled crash points -----------------------------------
+def sample(pts, cap):
+    if len(pts) <= cap:
+        return pts
+    step = len(pts) / cap
+    return [pts[int(i * step)] for i in range(cap)]
+
+sampled_pts = sample(crash_points, 4000)
+print(f"Fetching vehicle types for {len(sampled_pts)} sampled crash points ...")
+cid_to_vtype = {}
+sample_cids = [p["_cid"] for p in sampled_pts if p.get("_cid")]
+for i in range(0, len(sample_cids), 300):
+    batch = sample_cids[i:i + 300]
+    inlist = ",".join("'" + c + "'" for c in batch)
+    rows_v = soda("bm4k-52h4", {
+        "$select": "collision_id,vehicle_type_code_1",
+        "$where": f"collision_id in ({inlist})",
+        "$limit": len(batch) + 50,
+    })
+    for row_v in rows_v:
+        cv = row_v.get("collision_id")
+        if cv and cv not in cid_to_vtype:
+            cid_to_vtype[cv] = vehicle_type_bin(row_v.get("vehicle_type_code_1"))
+
+for p in sampled_pts:
+    cv = p.pop("_cid", None)
+    p["vtype"] = cid_to_vtype.get(cv, "other") if cv else "other"
+
+# --- Aggregated vehicle type stats for Upper Manhattan ped crashes -----------
+print("Computing Upper Manhattan vehicle type breakdown ...")
+all_umn_ped_pre  = set().union(*[umn_ped_ids[n]["pre"]  for n in UMN_NAMES])
+all_umn_ped_post = set().union(*[umn_ped_ids[n]["post"] for n in UMN_NAMES])
+vehicle_ksi = {
+    "pre":  vtype_counts(all_umn_ped_pre),
+    "post": vtype_counts(all_umn_ped_post),
+    "labels": VTYPE_LABELS,
+    "note": ("Counts pedestrian-involved crashes in CB9–CB12 by first-listed "
+             "vehicle type. Pre = full-year 2024; post = full-year 2025."),
+}
+print(f"  pre  (2024): {len(all_umn_ped_pre)} ped crashes → {vehicle_ksi['pre']}")
+print(f"  post (2025): {len(all_umn_ped_post)} ped crashes → {vehicle_ksi['post']}")
+
+# --- Latitude band gradient (boundary-vs-diversion test) --------------------
+print("Building latitude band gradient (9 bands × 2 years × 2 queries = ~36 API calls) ...")
+latitude_bands = build_latitude_bands()
+
+# --- Citywide monthly totals -> rest of NYC = citywide - above ---------------
 print("Aggregating citywide totals ...")
 city = {}
 agg = soda("h9gi-nx95", {
@@ -304,7 +502,7 @@ for mk, c in city.items():
     a = above.get(mk, new_bucket())
     rest[mk] = {f: max(0.0, c[f] - a[f]) for f in METRIC_FIELDS}
 
-# --- Plate origin: join collision_ids to the Vehicle dataset.
+# --- Plate origin: join collision_ids to the Vehicle dataset -----------------
 print("Fetching plate origins (Vehicle dataset) ...")
 
 
@@ -366,12 +564,15 @@ for yr, p in (("2024", "pre"), ("2025", "post")):
 print(f"  citywide pre/post: {plates['citywide']['pre']['oos_share']}% / "
       f"{plates['citywide']['post']['oos_share']}%")
 
-# --- Assemble ordered monthly series (drop partial trailing months).
+# --- Assemble ordered monthly series (drop partial trailing months) ----------
 LAG_MONTHS = 2
 _t = time.localtime()
 _cut = _t.tm_year * 12 + (_t.tm_mon - 1) - LAG_MONTHS
 LAST_MONTH = f"{_cut // 12:04d}-{_cut % 12 + 1:02d}"
-months = [m for m in sorted(set(above) | set(rest) | set(ues)) if m <= LAST_MONTH]
+_all_month_sets = [set(above), set(rest), set(ues)]
+for _bkts in umn_month_data.values():
+    _all_month_sets.append(set(_bkts))
+months = [m for m in sorted(set().union(*_all_month_sets)) if m <= LAST_MONTH]
 print(f"Series through {LAST_MONTH}")
 
 
@@ -388,9 +589,11 @@ def idx(raw, base):
     return [round(100 * v / base, 1) if base else None for v in raw]
 
 
+all_named_regions = [("above", above), ("ues", ues), ("uws", uws),
+                     ("rest", rest)] + list(umn_month_data.items())
+
 regions = {}
-for name, buckets in (("above", above), ("ues", ues), ("uws", uws),
-                      ("rest", rest)):
+for name, buckets in all_named_regions:
     regions[name] = {}
     for f in METRIC_FIELDS:
         raw = series(buckets, f)
@@ -404,8 +607,7 @@ def yr_total(buckets, field, yr):
 
 
 summary = {}
-for name, buckets in (("above", above), ("ues", ues), ("uws", uws),
-                      ("rest", rest)):
+for name, buckets in all_named_regions:
     summary[name] = {}
     for f in METRIC_FIELDS:
         pre, post = yr_total(buckets, f, 2024), yr_total(buckets, f, 2025)
@@ -426,7 +628,7 @@ for scope in SCOPES:
                     for pr, po in zip(pre, post)]}
 
 
-# --- Difference-in-differences: is the near-60th change real, net of trend?
+# --- Difference-in-differences: is the near-60th change real, net of trend? --
 def bandsum(scope, period, field, idxs):
     return sum(dist[scope][period][i][field] for i in idxs)
 
@@ -460,13 +662,6 @@ for corridor in ("ues", "uws"):
     did["corridors"][corridor] = cc
 
 
-def sample(pts, cap):
-    if len(pts) <= cap:
-        return pts
-    step = len(pts) / cap
-    return [pts[int(i * step)] for i in range(cap)]
-
-
 out = {
     "generated": time.strftime("%Y-%m-%d"),
     "pricing_date": PRICING,
@@ -476,19 +671,25 @@ out = {
     "distance": distance,
     "did": did,
     "plates": plates,
+    "latitude_bands": latitude_bands,
+    "vehicle_ksi": vehicle_ksi,
     "line_60th": [[L_A[1], L_A[0]], [L_B[1], L_B[0]]],
     "manhattan": MN,
     "ues_poly": UES,
     "uws_poly": UWS,
-    "crash_points": sample(crash_points, 4000),
+    "harlem_west_poly":    umn_geoms.get("harlem_west"),
+    "harlem_central_poly": umn_geoms.get("harlem_central"),
+    "harlem_east_poly":    umn_geoms.get("harlem_east"),
+    "washington_hts_poly": umn_geoms.get("washington_hts"),
+    "crash_points": sampled_pts,
 }
 with open("crash_data.json", "w") as f:
     json.dump(out, f, separators=(",", ":"))
 
 print("\n=== collisions 2024 -> 2025 ===")
-for name in ("above", "ues", "uws", "rest"):
+for name, _ in all_named_regions:
     s = summary[name]
-    print(f"  {name:6s} crashes {s['crashes']['pct']}%  "
+    print(f"  {name:16s} crashes {s['crashes']['pct']}%  "
           f"ped-crashes {s['ped_crashes']['pct']}%  "
           f"ped-injured {s['ped_injured']['pct']}%  "
           f"ped-killed {s['ped_killed']['pct']}%")
@@ -499,11 +700,17 @@ print("\n=== difference-in-differences (near-60th collisions) ===")
 for corridor in ("ues", "uws"):
     print(f"  corridor: {did['corridors'][corridor]['name']}")
     for comp in ("within", "vs_city"):
-        d = did["corridors"][corridor][comp]["crashes"]
-        r, pl = d["real"], d["placebo"]
+        d_r = did["corridors"][corridor][comp]["crashes"]
+        r_d, pl = d_r["real"], d_r["placebo"]
         print(f"    vs {did['corridors'][corridor][comp]['label']}: "
-              f"near {r['t0']}→{r['t1']} ({r['t_pct']:+}%) vs "
-              f"{r['c0']}→{r['c1']} ({r['c_pct']:+}%); RR {r['rr']} "
-              f"(CI {r['lo']}–{r['hi']}, p={r['p']}); placebo RR {pl['rr']} p={pl['p']}")
+              f"near {r_d['t0']}→{r_d['t1']} ({r_d['t_pct']:+}%) vs "
+              f"{r_d['c0']}→{r_d['c1']} ({r_d['c_pct']:+}%); RR {r_d['rr']} "
+              f"(CI {r_d['lo']}–{r_d['hi']}, p={r_d['p']}); "
+              f"placebo RR {pl['rr']} p={pl['p']}")
+print("\n=== latitude band gradient (ped crashes 2024→2025) ===")
+for lb in latitude_bands:
+    sign = "+" if (lb["pct_ped"] or 0) >= 0 else ""
+    print(f"  {lb['label']:18s} {lb['ped_2024']:4d}→{lb['ped_2025']:4d} "
+          f"({sign}{lb['pct_ped']}%)")
 print(f"\nWrote crash_data.json ({len(months)} months, "
-      f"{len(out['crash_points'])} pts)")
+      f"{len(sampled_pts)} pts)")
